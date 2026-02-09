@@ -678,7 +678,7 @@ class ScreenplayGPT(nn.Module):
     @classmethod
     def load(cls, path, device='cpu'):
         """Load model from checkpoint."""
-        checkpoint = torch.load(path, map_location=device)
+        checkpoint = torch.load(path, map_location=device, weights_only=False)
         model = cls(checkpoint['config'])
         model.load_state_dict(checkpoint['state_dict'])
         return model
@@ -988,8 +988,8 @@ def cmd_train(args):
     val_size = len(dataset) - train_size
     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
     
-    train_loader = DataLoader(train_dataset, batch_size=args.batch, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch, shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch, num_workers=2, pin_memory=True)
     
     print(f"Training samples: {len(train_dataset):,} | Validation samples: {len(val_dataset):,}")
     

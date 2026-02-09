@@ -1,0 +1,7 @@
+checkpoints/
+tokenizer/
+cleaned_data/
+screenplay_data/
+.venv/
+__pycache__/
+*.pt
