@@ -129,10 +129,12 @@ class BPETokenizer:
     
     def __init__(self, vocab_size=10000):
         self.vocab_size = vocab_size
-        self.vocab = {}             # token -> id mapping
-        self.inv_vocab = {}         # id -> token mapping (for decoding)
+        self.vocab = {}             # token -> id mapping (used for encoding)
+        self.id_to_bytes = {}       # id -> bytes mapping (used for decoding, no collisions)
+        self.inv_vocab = {}         # id -> token mapping (built from id_to_bytes)
         self.merges = {}            # (id1, id2) -> merged_id
         self.special_ids = {}       # quick lookup for special token ids
+        self._next_id = 0           # counter for assigning new token ids
         
         # GPT-2's tokenization pattern. It handles contractions like "don't" -> "don" + "'t"
         # and keeps punctuation attached to words in sensible ways
@@ -154,22 +156,28 @@ class BPETokenizer:
         # Initialize vocab with special tokens first (they get ids 0, 1, 2, ...)
         for i, tok in enumerate(SPECIAL_TOKENS):
             self.vocab[tok] = i
+            self.id_to_bytes[i] = tok.encode('utf-8')
             self.special_ids[tok] = i
+        self._next_id = len(SPECIAL_TOKENS)
         
         # Then add all 256 possible single bytes
         # These form the base "alphabet" that BPE builds upon
         n_special = len(SPECIAL_TOKENS)
         for byte_val in range(256):
-            self.vocab[bytes([byte_val])] = n_special + byte_val
+            b = bytes([byte_val])
+            tid = n_special + byte_val
+            self.vocab[b] = tid
+            self.id_to_bytes[tid] = b
+        self._next_id = n_special + 256
         
         # For very large corpora, sample random chunks to speed up training
-        # 50M chars is already quite a lot for learning good merges
-        if len(text) > 50_000_000:
+        # 5M chars is plenty for learning good merges
+        if len(text) > 5_000_000:
             import random
             sampled = []
-            for _ in range(500):
-                start = random.randint(0, len(text) - 100_000)
-                sampled.append(text[start:start + 100_000])
+            for _ in range(100):
+                start = random.randint(0, len(text) - 50_000)
+                sampled.append(text[start:start + 50_000])
             text = ''.join(sampled)
             if verbose:
                 print(f"  Sampled {len(text):,} characters for training")
@@ -188,7 +196,7 @@ class BPETokenizer:
             word_ids[word] = [n_special + b for b in byte_seq]
         
         # Main merge loop - keep merging most frequent pairs until we hit vocab size
-        n_merges = self.vocab_size - len(self.vocab)
+        n_merges = self.vocab_size - self._next_id
         
         for merge_num in range(n_merges):
             # Count how often each adjacent pair appears across all words
@@ -204,12 +212,15 @@ class BPETokenizer:
             
             # Find the most frequent pair and create a new token for it
             best_pair = pair_counts.most_common(1)[0][0]
-            new_id = len(self.vocab)
+            new_id = self._next_id
+            self._next_id += 1
             
             # The new token's byte representation is the concat of the two merged tokens
-            left_bytes = self._id_to_bytes(best_pair[0])
-            right_bytes = self._id_to_bytes(best_pair[1])
-            self.vocab[left_bytes + right_bytes] = new_id
+            left_bytes = self._get_token_bytes(best_pair[0])
+            right_bytes = self._get_token_bytes(best_pair[1])
+            merged_bytes = left_bytes + right_bytes
+            self.vocab[merged_bytes] = new_id  # may overwrite, that's ok for encoding
+            self.id_to_bytes[new_id] = merged_bytes  # this never collides
             self.merges[best_pair] = new_id
             
             # Update all word sequences to use the new merged token
@@ -219,11 +230,11 @@ class BPETokenizer:
             if verbose and (merge_num + 1) % 500 == 0:
                 print(f"  Completed {merge_num + 1}/{n_merges} merges")
         
-        # Build reverse vocab for decoding
-        self.inv_vocab = {v: k for k, v in self.vocab.items()}
+        # Build reverse vocab for decoding from the collision-free id_to_bytes
+        self.inv_vocab = {tid: self.id_to_bytes[tid] for tid in self.id_to_bytes}
         
         if verbose:
-            print(f"  Final vocabulary size: {len(self.vocab)}")
+            print(f"  Final vocabulary size: {self._next_id}")
     
     def _apply_merge(self, ids, pair, new_id):
         """Replace all occurrences of a token pair with the merged token."""
@@ -239,22 +250,17 @@ class BPETokenizer:
                 i += 1
         return result
     
-    def _id_to_bytes(self, token_id):
+    def _get_token_bytes(self, token_id):
         """Convert a token id back to its byte representation."""
+        if token_id in self.id_to_bytes:
+            return self.id_to_bytes[token_id]
+        # fallback for legacy
         n_special = len(SPECIAL_TOKENS)
-        
         if token_id < n_special:
-            # It's a special token
             return SPECIAL_TOKENS[token_id].encode('utf-8')
         elif token_id < n_special + 256:
-            # It's a single-byte token
             return bytes([token_id - n_special])
-        else:
-            # It's a merged token - look it up
-            tok = self.inv_vocab.get(token_id)
-            if isinstance(tok, bytes):
-                return tok
-            return tok.encode('utf-8') if tok else b''
+        return b''
     
     def encode(self, text):
         """
@@ -262,25 +268,34 @@ class BPETokenizer:
         
         Special tokens are handled separately (not split by BPE).
         Regular text is split into words, then each word is encoded
-        by applying learned merges.
+        by applying learned merges. Uses a cache for repeated words.
         """
         ids = []
+        cache = {}  # word -> encoded ids, big speedup for repeated words
         
         # Split on special tokens while keeping them in the result
         special_pattern = '|'.join(regex.escape(t) for t in SPECIAL_TOKENS)
         parts = regex.split(f'({special_pattern})', text)
         
-        for part in parts:
+        total_parts = len(parts)
+        for pi, part in enumerate(parts):
             if not part:
                 continue
             
             if part in self.special_ids:
-                # This is a special token - add its id directly
                 ids.append(self.special_ids[part])
             else:
-                # Regular text - split into words and encode each
                 for word in self._pat.findall(part):
-                    ids.extend(self._encode_word(word))
+                    if word in cache:
+                        ids.extend(cache[word])
+                    else:
+                        encoded = self._encode_word(word)
+                        cache[word] = encoded
+                        ids.extend(encoded)
+            
+            # Progress update every 100k parts
+            if pi % 100_000 == 0 and pi > 0:
+                print(f"  Encoding progress: {pi:,}/{total_parts:,} parts")
         
         return ids
     
@@ -314,12 +329,8 @@ class BPETokenizer:
         """Convert a list of token ids back to text."""
         byte_chunks = []
         for token_id in ids:
-            if token_id in self.inv_vocab:
-                tok = self.inv_vocab[token_id]
-                if isinstance(tok, str):
-                    byte_chunks.append(tok.encode('utf-8'))
-                else:
-                    byte_chunks.append(tok)
+            if token_id in self.id_to_bytes:
+                byte_chunks.append(self.id_to_bytes[token_id])
         
         # Join bytes and decode to string, replacing invalid sequences
         return b''.join(byte_chunks).decode('utf-8', errors='replace')
@@ -329,19 +340,21 @@ class BPETokenizer:
         path = Path(directory)
         path.mkdir(parents=True, exist_ok=True)
         
-        # Serialize vocab - need to convert bytes to hex strings for JSON
-        vocab_serialized = {}
-        for tok, tok_id in self.vocab.items():
-            if isinstance(tok, bytes):
-                vocab_serialized[tok.hex()] = tok_id
-            else:
-                vocab_serialized[f"s:{tok}"] = tok_id  # prefix string tokens
+        # Serialize id_to_bytes - keyed by id so no collisions
+        id_bytes_serialized = {}
+        for tid, b in self.id_to_bytes.items():
+            id_bytes_serialized[str(tid)] = b.hex()
+        
+        # Special tokens stored separately for clarity
+        specials = {tok: tid for tok, tid in self.special_ids.items()}
         
         merges_serialized = {f"{a},{b}": v for (a, b), v in self.merges.items()}
         
         data = {
             'vocab_size': self.vocab_size,
-            'vocab': vocab_serialized,
+            'next_id': self._next_id,
+            'id_to_bytes': id_bytes_serialized,
+            'special_tokens': specials,
             'merges': merges_serialized
         }
         
@@ -355,21 +368,28 @@ class BPETokenizer:
             data = json.load(f)
         
         tokenizer = cls(data['vocab_size'])
+        tokenizer._next_id = data.get('next_id', data['vocab_size'])
         
-        # Deserialize vocab
-        for key, tok_id in data['vocab'].items():
-            if key.startswith('s:'):
-                tokenizer.vocab[key[2:]] = tok_id
-            else:
-                tokenizer.vocab[bytes.fromhex(key)] = tok_id
+        # Rebuild id_to_bytes from serialized data
+        for tid_str, hex_str in data['id_to_bytes'].items():
+            tid = int(tid_str)
+            b = bytes.fromhex(hex_str)
+            tokenizer.id_to_bytes[tid] = b
+            tokenizer.vocab[b] = tid  # for encoding lookups
+        
+        # Restore special tokens (stored as strings, need string keys in vocab)
+        tokenizer.special_ids = data.get('special_tokens', {})
+        if not tokenizer.special_ids:
+            tokenizer.special_ids = {t: i for i, t in enumerate(SPECIAL_TOKENS)}
+        for tok, tid in tokenizer.special_ids.items():
+            tokenizer.vocab[tok] = tid
         
         # Deserialize merges
         for key, merged_id in data['merges'].items():
             left, right = map(int, key.split(','))
             tokenizer.merges[(left, right)] = merged_id
         
-        tokenizer.inv_vocab = {v: k for k, v in tokenizer.vocab.items()}
-        tokenizer.special_ids = {t: i for i, t in enumerate(SPECIAL_TOKENS)}
+        tokenizer.inv_vocab = dict(tokenizer.id_to_bytes)
         
         return tokenizer
     
@@ -709,14 +729,14 @@ class ScreenplayDataset(Dataset):
         print(f"Dataset contains {len(self.data):,} tokens")
     
     def __len__(self):
-        # Number of possible starting positions
-        return max(0, len(self.data) - self.block_size - 1)
+        # Non-overlapping chunks of block_size tokens
+        return max(0, (len(self.data) - 1) // self.block_size)
     
     def __getitem__(self, idx):
-        # Input: tokens at positions [idx, idx + block_size)
-        # Target: tokens at positions [idx + 1, idx + block_size + 1)
-        x = self.data[idx : idx + self.block_size]
-        y = self.data[idx + 1 : idx + self.block_size + 1]
+        # Non-overlapping chunks: each sample starts at idx * block_size
+        start = idx * self.block_size
+        x = self.data[start : start + self.block_size]
+        y = self.data[start + 1 : start + self.block_size + 1]
         return x, y
 
 
@@ -746,7 +766,7 @@ def get_device():
     return 'cpu'
 
 
-def train_model(model, train_loader, val_loader, config, output_dir, device):
+def train_model(model, train_loader, val_loader, config, output_dir, device, max_steps=0):
     """
     Main training loop.
     
@@ -800,6 +820,11 @@ def train_model(model, train_loader, val_loader, config, output_dir, device):
             if global_step % config.log_every == 0:
                 print(f"Epoch {epoch+1} | Step {global_step} | Loss: {loss.item():.4f} | LR: {lr:.2e}")
             
+            # Max steps check
+            if max_steps > 0 and global_step >= max_steps:
+                print(f"Reached max steps ({max_steps}). Stopping.")
+                break
+            
             # Validation
             if global_step % config.eval_every == 0:
                 val_loss = evaluate_model(model, val_loader, device)
@@ -818,6 +843,9 @@ def train_model(model, train_loader, val_loader, config, output_dir, device):
         
         epoch_time = time.time() - epoch_start
         print(f"Epoch {epoch+1} completed in {epoch_time:.1f}s")
+        
+        if max_steps > 0 and global_step >= max_steps:
+            break
     
     # Save final model
     model.save(str(output_path / 'final.pt'))
@@ -979,7 +1007,7 @@ def cmd_train(args):
         tokenizer.save(args.tokenizer)
     
     # Create model
-    config = ModelConfig(vocab_size=len(tokenizer.vocab))
+    config = ModelConfig(vocab_size=tokenizer._next_id)
     model = ScreenplayGPT(config).to(device)
     
     # Load and split dataset
@@ -995,7 +1023,7 @@ def cmd_train(args):
     
     # Train
     train_config = TrainConfig(batch_size=args.batch, lr=args.lr, epochs=args.epochs)
-    train_model(model, train_loader, val_loader, train_config, args.output, device)
+    train_model(model, train_loader, val_loader, train_config, args.output, device, max_steps=args.max_steps)
 
 
 def cmd_generate(args):
@@ -1120,6 +1148,7 @@ def main():
     train_parser.add_argument('--epochs', type=int, default=10, help='Number of epochs')
     train_parser.add_argument('--batch', type=int, default=32, help='Batch size')
     train_parser.add_argument('--lr', type=float, default=3e-4, help='Learning rate')
+    train_parser.add_argument('--max-steps', type=int, default=0, help='Max training steps (0=unlimited)')
     
     # Generate subcommand
     gen_parser = subparsers.add_parser('generate', help='Generate screenplay text')
